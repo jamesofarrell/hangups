@@ -3,6 +3,7 @@
 import appdirs
 import asyncio
 import configargparse
+import contextlib
 import logging
 import os
 import sys
@@ -80,13 +81,18 @@ class ChatUI(object):
 
         self._urwid_loop.screen.set_terminal_properties(colors=palette_colors)
         self._urwid_loop.start()
-        try:
-            # Returns when the connection is closed.
-            loop.run_until_complete(self._client.connect())
-        finally:
-            # Ensure urwid cleans up properly and doesn't wreck the terminal.
-            self._urwid_loop.stop()
-            loop.close()
+        # Enable bracketed paste mode after the terminal has been switched to
+        # the alternate screen (after MainLoop.start() to work around bug
+        # 729533 in VTE.
+        with bracketed_paste_mode():
+            try:
+                # Returns when the connection is closed.
+                loop.run_until_complete(self._client.connect())
+            finally:
+                # Ensure urwid cleans up properly and doesn't wreck the
+                # terminal.
+                self._urwid_loop.stop()
+                loop.close()
 
     def _input_filter(self, keys, _):
         """Handle global keybindings."""
@@ -330,13 +336,17 @@ class ReturnableEdit(urwid.Edit):
     """Edit widget that clears itself and calls a function on return."""
 
     def __init__(self, on_return, keybindings, caption=None):
-        super().__init__(caption=caption)
+        super().__init__(caption=caption, multiline=True)
         self._on_return = on_return
         self._keys = keybindings
+        self._paste_mode = False
 
     def keypress(self, size, key):
-        key = super().keypress(size, key)
-        if key == 'enter':
+        if key == 'begin paste':
+            self._paste_mode = True
+        elif key == 'end paste':
+            self._paste_mode = False
+        elif key == 'enter' and not self._paste_mode:
             self._on_return(self.get_edit_text())
             self.set_edit_text('')
         elif key not in self._keys.values() and key in readlike.keys():
@@ -344,7 +354,7 @@ class ReturnableEdit(urwid.Edit):
             self.set_edit_text(text)
             self.set_edit_pos(pos)
         else:
-            return key
+            return super().keypress(size, key)
 
 
 class StatusLineWidget(urwid.WidgetWrap):
@@ -830,6 +840,16 @@ def set_terminal_title(title):
     sys.stdout.write("\x1b]2;{}\x07".format(title))
 
 
+@contextlib.contextmanager
+def bracketed_paste_mode():
+    """Context manager for enabling/disabling bracketed paste mode."""
+    sys.stdout.write('\x1b[?2004h')
+    try:
+        yield
+    finally:
+        sys.stdout.write('\x1b[?2004l')
+
+
 def dir_maker(path):
     """Create a directory if it does not exist."""
     directory = os.path.dirname(path)
@@ -846,16 +866,18 @@ def main():
     dirs = appdirs.AppDirs('hangups', 'hangups')
     default_log_path = os.path.join(dirs.user_log_dir, 'hangups.log')
     default_token_path = os.path.join(dirs.user_cache_dir, 'refresh_token.txt')
-    default_config_path = os.path.join(dirs.user_config_dir, 'hangups.conf')
+    default_config_path = 'hangups.conf'
+    user_config_path = os.path.join(dirs.user_config_dir, 'hangups.conf')
 
     # Create a default empty config file if does not exist.
-    dir_maker(default_config_path)
-    if not os.path.isfile(default_config_path):
-        with open(default_config_path, 'a') as cfg:
+    dir_maker(user_config_path)
+    if not os.path.isfile(user_config_path):
+        with open(user_config_path, 'a') as cfg:
             cfg.write("")
 
     parser = configargparse.ArgumentParser(
-        prog='hangups', default_config_files=[default_config_path],
+        prog='hangups', default_config_files=[default_config_path,
+                                              user_config_path],
         formatter_class=configargparse.ArgumentDefaultsHelpFormatter,
         add_help=False,  # Disable help so we can add it to the correct group.
     )
@@ -869,7 +891,7 @@ def main():
     general_group.add('--time-format', default='(%I:%M:%S %p)',
                       help='time format string')
     general_group.add('-c', '--config', help='configuration file path',
-                      is_config_file=True, default=default_config_path)
+                      is_config_file=True, default=user_config_path)
     general_group.add('-v', '--version', action='version',
                       version='hangups {}'.format(hangups.__version__))
     general_group.add('-d', '--debug', action='store_true',
